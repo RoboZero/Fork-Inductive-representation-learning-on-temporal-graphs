@@ -18,6 +18,12 @@ class MergeLayer(torch.nn.Module):
         torch.nn.init.xavier_normal_(self.fc2.weight)
         
     def forward(self, x1, x2):
+        # edit
+        if len(x1.shape) == 1:
+            x1 = x1.unsqueeze(0)
+        if len(x2.shape) == 1:
+            x2 = x2.unsqueeze(0)
+
         x = torch.cat([x1, x2], dim=1)
         #x = self.layer_norm(x)
         h = self.act(self.fc1(x))
@@ -39,7 +45,7 @@ class ScaledDotProductAttention(torch.nn.Module):
         attn = attn / self.temperature
 
         if mask is not None:
-            attn = attn.masked_fill(mask, -1e10)
+            attn = attn.masked_fill(mask.to(torch.bool), -1e10)
 
         attn = self.softmax(attn) # [n * b, l_q, l_k]
         attn = self.dropout(attn) # [n * b, l_v, d]
@@ -69,7 +75,7 @@ class MultiHeadAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
 
         self.fc = nn.Linear(n_head * d_v, d_model)
-        
+         
         nn.init.xavier_normal_(self.fc.weight)
 
         self.dropout = nn.Dropout(dropout)
@@ -372,6 +378,9 @@ class AttnModel(torch.nn.Module):
         mask = mask.permute([0, 2, 1]) #mask [B, 1, N]
 
         # # target-attention
+        
+        # print("k device, shape:", k.device, k.shape)
+        # print("Query weight device:", self.query_linears[0].weight.device)
         output, attn = self.multi_head_target(q=q, k=k, v=k, mask=mask) # output: [B, 1, D + Dt], attn: [B, 1, N]
         output = output.squeeze()
         attn = attn.squeeze()

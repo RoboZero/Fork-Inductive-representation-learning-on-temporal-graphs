@@ -52,7 +52,7 @@ NUM_HEADS = args.n_head
 DROP_OUT = args.drop_out
 GPU = args.gpu
 UNIFORM = args.uniform
-NEW_NODE = args.new_node
+# NEW_NODE = args.new_node
 USE_TIME = args.time
 AGG_METHOD = args.agg_method
 ATTN_MODE = args.attn_mode
@@ -117,11 +117,81 @@ def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label):
     return np.mean(val_acc), np.mean(val_ap), np.mean(val_f1), np.mean(val_auc)
 
 ### Load data and train val test split
-g_df = pd.read_csv('./processed/ml_{}.csv'.format(DATA))
-e_feat = np.load('./processed/ml_{}.npy'.format(DATA))
-n_feat = np.load('./processed/ml_{}_node.npy'.format(DATA))
+# g_df = pd.read_csv('./processed/ml_{}.csv'.format(DATA))
+# e_feat = np.load('./processed/ml_{}.npy'.format(DATA))
+# n_feat = np.load('./processed/ml_{}_node.npy'.format(DATA))
 
-val_time, test_time = list(np.quantile(g_df.ts, [0.70, 0.85]))
+# g_df = pd.read_csv('./processed/ml_reddit.csv'.format(DATA))
+# e_feat = np.load('./processed/ml_synthetic_baseline.npy'.format(DATA))
+# n_feat = np.load('./processed/ml_{}_node.npy'.format(DATA))
+
+# val_time, test_time = list(np.quantile(g_df.ts, [0.70, 0.85]))
+
+### Load data and train val test split
+logger.info('Loading synthetic sparse matrix data...')
+
+# --- 1. Load your synthetic sparse matrix here ---
+# Assuming 'synthetic_matrix' is a NumPy array of shape (num_edges, 3)
+# Example: synthetic_matrix = np.array([[source, dest, time], ...])
+# g_df = pd.read_csv("synthetic\synthetic\synthetic_baseline\synthetic_baseline.csv".format(DATA), header=None, names=['u', 'i', 'ts'])
+# g_df = pd.read_csv("processed\mask_2B.csv")
+g_df = pd.read_csv('./processed/ml_{}.csv'.format(DATA))
+# g_df = pd.read_csv('./processed/ml_synthetic_baseline.csv'.format(DATA))
+
+# If you loaded your sparse matrix via Pandas:# g_df = pd.read_csv('./processed/your_synthetic_file.csv') 
+# Convert the whole thing to a NumPy array once to make slicing easy:
+synthetic_matrix = g_df.values # Now this NumPy-style slicing will work perfectly:
+src_l_raw = synthetic_matrix[:, 1].astype(int)
+dst_l_raw = synthetic_matrix[:, 2].astype(int)
+ts_l_raw  = synthetic_matrix[:, 3].astype(int)
+
+# --- 2. Enforce TGAT's 1-Based Indexing Rule ---
+# TGAT reserves index 0 for "null" or "padding" nodes/edges.
+# If your synthetic nodes start at 0, we must shift them up by 1.
+# if src_l_raw.min() == 0 or dst_l_raw.min() == 0:
+#     src_l_raw += 1
+#     dst_l_raw += 1
+
+# --- 3. Chronological Sorting (CRITICAL) ---
+# The model must process events in strict time order to prevent data leakage.
+sort_idx = np.argsort(ts_l_raw)
+src_l = src_l_raw[sort_idx]
+dst_l = dst_l_raw[sort_idx]
+ts_l = ts_l_raw[sort_idx]
+
+num_edges = len(src_l)
+max_node_id = max(src_l.max(), dst_l.max())
+
+# --- 4. Generate Edge Indices and Labels ---
+e_idx_l = np.arange(1, num_edges + 1) # Must start at 1
+label_l = np.ones(num_edges)          # 1 means observed edge
+
+# g_df.insert(3, "idx", e_idx_l.tolist())
+# g_df.insert(4, "label", label_l.tolist())
+
+# --- 5. Generate Features (Fixes your Dimension Errors) ---
+# We use NODE_DIM (from your argparse) to ensure the tensor shapes exactly 
+# match what the Attention layers are initialized to expect.
+logger.info(f'Generating features with Node/Edge Dim: {NODE_DIM}')
+
+# +1 is required because index 0 is the null/padding vector
+n_feat = np.random.randn(max_node_id + 1, NODE_DIM).astype(np.float32)
+n_feat[0] = 0  
+
+# Ensure edge features match node features in dimension
+e_feat = np.random.randn(num_edges + 1, NODE_DIM).astype(np.float32)
+e_feat[0] = 0  
+
+# --- 6. Set Time Splits ---
+val_time, test_time = list(np.quantile(ts_l, [0.70, 0.85]))
+
+# max_src_index = src_l.max()
+# max_idx = max_node_id
+
+# logger.info(f'Successfully loaded {max_node_id} nodes and {num_edges} temporal edges.')
+
+# ... [The rest of the file continues with: random.seed(2020)] ...
+
 
 src_l = g_df.u.values
 dst_l = g_df.i.values
@@ -316,8 +386,68 @@ logger.info('Saving TGAN model')
 torch.save(tgan.state_dict(), MODEL_SAVE_PATH)
 logger.info('TGAN models saved')
 
- 
+# --- Full edge prediction section ---
+logger.info('TGAN model being used to predict all edges')
 
+tgan.eval()
+tgan.ngh_finder = full_ngh_finder
+device = torch.device(f'cuda:{GPU}')
+tgan.to(device)
 
+# infer dimensions from data
+num_src = max(src_l)
+num_dst = max(dst_l)
+num_time = int(ts_l.max()) + 1
+NUM_NEIGHBORS = NUM_NEIGHBORS  # already defined
+BATCH_SIZE = 4096
+THRESHOLD = 0.5
 
+import numpy as np
 
+# create all possible edges
+src_grid, dst_grid, time_grid = np.meshgrid(
+    np.arange(1, num_src+1),
+    np.arange(1, num_dst+1),
+    np.arange(num_time),
+    indexing='ij'
+)
+src_edges = src_grid.flatten()
+dst_edges = dst_grid.flatten()
+ts_edges = time_grid.flatten()
+
+predicted_edges_lines = []
+num_batches = int(np.ceil(len(src_edges) / BATCH_SIZE))
+
+logger.info('Created all edges')
+for i in range(num_batches):
+    start = i * BATCH_SIZE
+    end = min((i+1) * BATCH_SIZE, len(src_edges))
+    
+    src_batch = torch.tensor(src_edges[start:end], device=device)
+    dst_batch = torch.tensor(dst_edges[start:end], device=device)
+    ts_batch = torch.tensor(ts_edges[start:end], device=device)
+    
+    with torch.no_grad():
+        pos_prob, _ = tgan.contrast(
+            src_batch.cpu().numpy(),
+            dst_batch.cpu().numpy(),
+            dst_batch.cpu().numpy(),
+            ts_batch.cpu().numpy(),
+            NUM_NEIGHBORS
+        )
+        pos_prob = pos_prob.cpu().numpy()
+    
+    mask = pos_prob >= THRESHOLD
+    for s, d, t, keep in zip(src_batch.cpu().numpy(), dst_batch.cpu().numpy(), ts_batch.cpu().numpy(), mask):
+        if keep:
+            predicted_edges_lines.append(f"{s},{d},{t}")
+    
+    logger.info(f'Created edges: ({start}, {end})/total({len(src_edges)})')
+
+# save to file
+output_file = f'predicted_edges_{DATA}_{args.prefix}.csv'
+with open(output_file, "w") as f:
+    for line in predicted_edges_lines:
+        f.write(line + "\n")
+
+logger.info(f"Predicted edges saved to {output_file}, total: {len(predicted_edges_lines)}")

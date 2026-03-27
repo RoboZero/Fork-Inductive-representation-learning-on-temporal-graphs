@@ -1,0 +1,6 @@
+extra/*
+log/*
+output/*
+saved_checkpoints/*
+saved_models/*
+processed/*
